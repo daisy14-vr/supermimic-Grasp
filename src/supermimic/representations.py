@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -52,6 +53,16 @@ from supermimic.utils.maxcoord_helpers import (
 )
 from supermimic.utils.tracking_reward import tracking_reward
 
+# Extra representations registered by task packages (e.g. supermimic.grasp):
+# name -> factory(full_state_dim, num_actions, default_joint_pos, contact_dim).
+_EXTRA_REPRESENTATIONS: dict[str, Callable[..., StateRepresentation]] = {}
+
+
+def register_representation(
+  name: str, factory: Callable[..., StateRepresentation]
+) -> None:
+  _EXTRA_REPRESENTATIONS[name] = factory
+
 
 def create_representation(
   name: str,
@@ -61,6 +72,7 @@ def create_representation(
   decimation: int,
   default_joint_pos: torch.Tensor,
   actor_obs_mode: str,
+  contact_dim: int = 0,
 ) -> StateRepresentation:
   """Create a state representation wired up for training and reward compute."""
   if name == "gencoord":
@@ -72,10 +84,13 @@ def create_representation(
         f"Maxcoord full_state_dim ({full_state_dim}) must be divisible by 13"
       )
     rep = MaxCoordRepresentation(full_state_dim // 13, default_joint_pos)
-  else:
-    raise ValueError(
-      f"Unknown representation: {name}. Must be 'gencoord' or 'maxcoord'."
+  elif name in _EXTRA_REPRESENTATIONS:
+    rep = _EXTRA_REPRESENTATIONS[name](
+      full_state_dim, num_actions, default_joint_pos, contact_dim
     )
+  else:
+    known = ["gencoord", "maxcoord", *_EXTRA_REPRESENTATIONS]
+    raise ValueError(f"Unknown representation: {name}. Must be one of {known}.")
   rep.actor_obs_mode = actor_obs_mode
   if actor_obs_mode == "proprio":
     rep.register_buffer(
@@ -264,6 +279,9 @@ class StateRepresentation(nn.Module, ABC):
   }
 
   substep_coeff: float = 1.0
+  # Per-step contact logits the dynamics also predicts (0: none). Representations
+  # with contacts implement ``object_reward`` / ``object_term_prob``.
+  contact_dim: int = 0
 
   # ------------------------------------------------------------------
   # Abstract methods (must be implemented by subclasses)
@@ -355,7 +373,7 @@ class StateRepresentation(nn.Module, ABC):
   ) -> torch.Tensor:
     """Sensor-or-state half of the actor input (no goal).
 
-    Returns ``rep_state`` in rep_state mode. In proprio mode, returns
+    Returns ``actor_state(rep_state)`` in rep_state mode. In proprio mode, returns
     ``sim_actor_obs`` if provided (mjlab's ``obs["actor"]``) else
     synthesizes via :meth:`compute_wm_obs`; ``noisy=True`` adds per-dim
     uniform jitter scaled by the precomputed ``_proprio_noise_bounds``. ``aux_state``,
@@ -363,7 +381,7 @@ class StateRepresentation(nn.Module, ABC):
     (proprio mode with no ``sim_actor_obs``).
     """
     if self.actor_obs_mode == "rep_state":
-      return rep_state
+      return self.actor_state(rep_state)
     if sim_actor_obs is not None:
       obs = sim_actor_obs
     else:
@@ -381,6 +399,16 @@ class StateRepresentation(nn.Module, ABC):
   # ------------------------------------------------------------------
   # Default implementations (may be overridden)
   # ------------------------------------------------------------------
+
+  @property
+  def actor_state_dim(self) -> int:
+    """Width of :meth:`actor_state`, the actor's input in rep_state mode."""
+    return self.rep_state_dim
+
+  def actor_state(self, rep_state: torch.Tensor) -> torch.Tensor:
+    """The part of ``rep_state`` the actor sees in rep_state mode (all of it by
+    default); the critic and the world model always see the full state."""
+    return rep_state
 
   def compute_wm_goal(
     self,

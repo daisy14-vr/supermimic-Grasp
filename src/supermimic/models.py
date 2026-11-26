@@ -66,6 +66,8 @@ class Dynamics(nn.Module):
     self.num_actions = num_actions
     self.dt = representation.dt
     self._apply_prediction = representation.apply_prediction
+    self.prediction_dim = representation.prediction_dim
+    self.contact_dim = representation.contact_dim
 
     self.register_buffer("action_scale", action_scale.clone())
     self.register_buffer("action_offset", action_offset.clone())
@@ -76,8 +78,13 @@ class Dynamics(nn.Module):
     self.mlp = build_mlp(
       self.num_rep_state + num_actions + sim_ctx_dim,
       hidden_dims,
-      output_dim=representation.prediction_dim,
+      output_dim=representation.prediction_dim + representation.contact_dim,
     )
+    if self.contact_dim:
+      # Sparse contact prior (sigmoid(-3) ~ 5%), as in Dex-SuperMimic.
+      head = [m for m in self.mlp.modules() if isinstance(m, nn.Linear)][-1]
+      with torch.no_grad():
+        head.bias[self.prediction_dim :] = -3.0
 
   def proc(self, action: torch.Tensor) -> torch.Tensor:
     """Map raw policy output to proc joint commands: ``action * scale + offset``."""
@@ -90,12 +97,32 @@ class Dynamics(nn.Module):
     aux_state: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> tuple[torch.Tensor, torch.Tensor]:
+    next_aux, next_rep, _ = self.forward_with_contacts(
+      rep_state, action, aux_state, sim_ctx
+    )
+    return next_aux, next_rep
+
+  def forward_with_contacts(
+    self,
+    rep_state: torch.Tensor,
+    action: torch.Tensor,
+    aux_state: torch.Tensor,
+    sim_ctx: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``forward`` plus the representation's per-step contact logits (width
+    ``contact_dim``, empty when the representation has none). The logits score the
+    contacts of the predicted next state and are not fed back into the state."""
     state_norm = self.state_normalizer(rep_state)
     action_norm = self.action_normalizer(self.proc(action))
     x = torch.cat([state_norm, action_norm, sim_ctx], dim=-1)
     with torch.autocast("cuda", torch.bfloat16, enabled=x.is_cuda):
-      prediction = self.mlp(x).float()
-    return self._apply_prediction(aux_state, rep_state, prediction, self.dt)
+      out = self.mlp(x).float()
+    prediction = out[..., : self.prediction_dim]
+    contact_logits = out[..., self.prediction_dim :]
+    next_aux, next_rep = self._apply_prediction(
+      aux_state, rep_state, prediction, self.dt
+    )
+    return next_aux, next_rep, contact_logits
 
   def normalizers(self) -> list[_CudaGraphNormalization]:
     return [self.state_normalizer, self.action_normalizer]

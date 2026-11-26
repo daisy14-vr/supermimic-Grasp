@@ -208,7 +208,7 @@ class TestLossBlocks:
     batch, horizon = 2, cfg.horizon
     full_states = _random_full_states(rep, batch, horizon)
     init_aux = rep.extract_aux_state(full_states[:, 0, :]).requires_grad_(True)
-    _, pred_aux_states = learner._rollout(
+    _, pred_aux_states, _ = learner._rollout(
       rep.represent(full_states)[:, 0, :],
       _randn(batch, horizon, NUM_ACTIONS, seed=1),
       init_aux,

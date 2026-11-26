@@ -113,7 +113,12 @@ class TestSoftTermination:
     env._ref_body_state = (*_reference(env), None, None)
     env.aux_state = _aux()
     aux = _aux(z_offset=ANCHOR_POS_THRESHOLD).requires_grad_(True)
-    env.dynamics = MagicMock(return_value=(aux, env.rep_state))
+    env.dynamics = MagicMock()
+    env.dynamics.forward_with_contacts.return_value = (
+      aux,
+      env.rep_state,
+      torch.zeros(BATCH, 0),
+    )
     _, _, term_prob = env.step(torch.zeros(BATCH, ACTION_DIM))
     torch.testing.assert_close(term_prob.detach(), torch.full((BATCH,), 0.5))
     term_prob.sum().backward()

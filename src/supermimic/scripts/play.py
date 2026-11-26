@@ -19,7 +19,11 @@ from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
 from supermimic.runners.run_config import check_representation_matches, load_runner_cfg
-from supermimic.runners.supermimic_runner import build_actor, build_world_model
+from supermimic.runners.supermimic_runner import (
+  SuperMimicRunnerCfg,
+  build_actor,
+  build_world_model,
+)
 from supermimic.scripts.viewers import (
   SuperMimicNativeViewer,
   SuperMimicViserViewer,
@@ -33,7 +37,13 @@ from supermimic.utils.wandb_artifacts import (
 
 @dataclass
 class PlayConfig:
-  wandb_path: str
+  wandb_path: str | None = None
+  """W&B run to load the runner config and latest model checkpoint from."""
+  checkpoint_dir: str | None = None
+  """Local run dir (``logs/<task>/<timestamp>``) holding ``world_model.pt`` and
+  ``actor.pt``, e.g. from an offline run. The runner config is the default one
+  with the representation inferred from the task id, so runs trained with
+  non-default runner flags (network sizes, actor_obs, history) need --wandb-path."""
   motion_file: str | None = None
   initial_task: Literal["motion", "velocity"] = "motion"
   """Task selected when the viewer opens. Switch live via the GUI dropdown."""
@@ -51,14 +61,28 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   env_cfg.scene.num_envs = 1
   env_cfg.observations["actor"].enable_corruption = True
 
-  import wandb
+  if (cfg.wandb_path is None) == (cfg.checkpoint_dir is None):
+    raise ValueError("pass exactly one of --wandb-path or --checkpoint-dir")
 
-  print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
-  run = wandb.Api().run(cfg.wandb_path)
-  runner_cfg = load_runner_cfg(run.config)
+  run = None
+  if cfg.checkpoint_dir is not None:
+    runner_cfg = SuperMimicRunnerCfg()
+    if "Grasp" in task_id:
+      runner_cfg.representation = "gencoord_object"
+    elif "MaxCoord" in task_id:
+      runner_cfg.representation = "maxcoord"
+    print(f"[INFO] Loading local checkpoint: {cfg.checkpoint_dir}")
+  else:
+    import wandb
+
+    print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
+    run = wandb.Api().run(cfg.wandb_path)
+    runner_cfg = load_runner_cfg(run.config)
   check_representation_matches(task_id, runner_cfg.representation)
 
-  motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
+  motion_artifacts = (
+    [a for a in run.used_artifacts() if a.type == "motions"] if run else []
+  )
   command_term = env_cfg.commands["motion"]
   assert isinstance(command_term, MotionCommandCfg)
   motion_names: list[str] = []
@@ -90,7 +114,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   representation = wm.representation
   dynamics = wm.dynamics
 
-  model_dir = download_model_dir(run)
+  model_dir = Path(cfg.checkpoint_dir) if run is None else download_model_dir(run)
   wm.load_bundle(torch.load(model_dir / "world_model.pt", map_location=device))
   dynamics.eval()
 

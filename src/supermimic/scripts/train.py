@@ -58,6 +58,7 @@ def main() -> None:
   device = setup_device(args.device)
   print(f"[INFO] Loading environment: {chosen_task}")
 
+  grasp = "Grasp" in chosen_task
   if args.motion_file:
     # Local motions handed straight to MotionLoader (globs/concatenates).
     if "," in args.motion_file:
@@ -68,12 +69,19 @@ def main() -> None:
       args.env.commands["motion"].motion_file = os.path.expanduser(args.motion_file)
     args.registry_name = None  # avoid linking a stale registry artifact for lineage
     print(f"[INFO] Using local motion file: {args.motion_file}")
+  elif grasp:
+    # Grasp tasks default to the local procedural clips set in their env cfg.
+    args.registry_name = None
+    print(f"[INFO] Using grasp clips: {args.env.commands['motion'].motion_file}")
   else:
     motion_file = download_registry_motions(args.registry_name)
     if motion_file is not None:
       args.env.commands["motion"].motion_file = motion_file
 
   # Auto-detect representation from task_id if not explicitly set
+  if grasp and args.runner.representation == "gencoord":
+    args.runner.representation = "gencoord_object"
+    print("[INFO] Auto-detected gencoord_object representation (grasp task)")
   if "MaxCoord" in chosen_task and args.runner.representation == "gencoord":
     args.runner.representation = "maxcoord"
     print("[INFO] Auto-detected maxcoord representation from task_id")

@@ -72,16 +72,25 @@ def make_mock_sim_context() -> SimContext:
 
 def make_mock_dynamics() -> MagicMock:
   """Mock ``Dynamics``: ``forward(rep_state, action, aux_state, sim_ctx)`` returns
-  random ``(aux_state, rep_state)`` shaped like its inputs."""
-  return MagicMock(
+  random ``(aux_state, rep_state)`` shaped like its inputs; ``forward_with_contacts``
+  adds empty contact logits (no contact head)."""
+  dyn = MagicMock(
     side_effect=lambda rs, a, aux, ctx: (torch.randn_like(aux), torch.randn_like(rs))
   )
+  dyn.contact_dim = 0
+  dyn.forward_with_contacts.side_effect = lambda rs, a, aux, ctx: (
+    torch.randn_like(aux),
+    torch.randn_like(rs),
+    rs.new_zeros(*rs.shape[:-1], 0),
+  )
+  return dyn
 
 
 def make_mock_wm_representation(batch: int) -> MagicMock:
   """Mock MaxCoord ``StateRepresentation`` wired for the WM env's call path."""
   rep = MagicMock()
   rep.num_bodies = 14
+  rep.contact_dim = 0
   rep.represent.side_effect = lambda x: torch.randn(*x.shape[:-1], 214, device=x.device)
   rep.extract_aux_state.side_effect = lambda x: torch.randn(
     *x.shape[:-1], 7, device=x.device

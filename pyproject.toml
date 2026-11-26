@@ -14,10 +14,22 @@ dependencies = [
     "mjlab",
     "ruff>=0.14.10",
     "viser>=1.0.24",
+    # Pinned here (not only via mjlab) so the CUDA 12 sources below apply: the
+    # target machine's NVIDIA driver supports CUDA 12.6, and the default PyPI
+    # wheels (torch +cu132, warp CUDA 13) need a newer driver.
+    "torch>=2.14.0,<2.15",
+    "warp-lang==1.19.0",
 ]
 
 [tool.uv.sources]
 mjlab = { path = "../mjlab_research", editable = true }
+torch = { index = "pytorch-cu126", marker = "sys_platform == 'linux'" }
+warp-lang = { url = "https://github.com/NVIDIA/warp/releases/download/v1.19.0/warp_lang-1.19.0+cu12-py3-none-manylinux_2_28_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
 
 [tool.ruff]
 src = ["src"]

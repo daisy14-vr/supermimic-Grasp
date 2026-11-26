@@ -54,7 +54,7 @@ class SuperMimicRunnerCfg:
   wandb_run_path: str | None = None
   headless: bool = True
   buffer_size: int = 1000
-  representation: str = "gencoord"  # "gencoord" or "maxcoord"
+  representation: str = "gencoord"  # "gencoord", "maxcoord" or "gencoord_object"
   actor_obs: str = "rep_state"  # "rep_state" or "proprio"
   log_interval: int = 10
   save_interval: int = 1000
@@ -124,6 +124,8 @@ def build_world_model(
   obs, _ = env.reset()
   num_full_state, num_goals = unpack_obs_dims(obs)
   num_actions = env.num_actions
+  # Envs with a ``contact`` obs group (the grasp task) supervise a contact head.
+  contact_dim = obs["contact"].shape[-1] if "contact" in obs.keys() else 0
 
   print(f"[INFO] State Dim: {num_full_state}, Goal Dim: {num_goals}")
 
@@ -142,6 +144,7 @@ def build_world_model(
     env.unwrapped.cfg.decimation,
     default_joint_pos,
     actor_obs_mode=cfg.actor_obs,
+    contact_dim=contact_dim,
   ).to(device)
 
   representation.bind(env.unwrapped, sim_context)
@@ -177,7 +180,7 @@ def build_actor(
   """Actor sized by ``cfg``; the resolved task specs live on ``actor.task_specs``."""
   representation = wm.representation
   obs_dim = (
-    representation.rep_state_dim
+    representation.actor_state_dim
     if cfg.actor_obs == "rep_state"
     else representation.proprio_obs_dim(wm.num_actions)
   )
@@ -334,6 +337,8 @@ class SuperMimicRunner:
         self._representation.proprio_obs_dim(self._num_actions)
       )
     schema["sim_ctx"] = FieldSpec(self._sim_context.output_dim)
+    if self._representation.contact_dim:
+      schema["contact"] = FieldSpec(self._representation.contact_dim)
     return schema
 
   def _step_and_store(
@@ -535,6 +540,8 @@ class SuperMimicRunner:
       actions = self.policy_learner.actor(actor_td)
 
       extra_fields = {"sim_ctx": sim_ctx}
+      if self._representation.contact_dim:
+        extra_fields["contact"] = obs["contact"].to(self.device)
       if self._stores_actor_obs:
         extra_fields["actor_obs"] = sim_actor_obs
 
@@ -570,6 +577,38 @@ class SuperMimicRunner:
     self.policy_learner.actor.train()
     for actor_td in actor_inputs:
       self.policy_learner.actor.update_normalization(actor_td)
+
+  def _save_checkpoint(
+    self, log_dir: Path, uploader: ThreadPoolExecutor, upload: Future | None
+  ) -> Future:
+    """Write the world model, actor, critic (and ONNX) and queue their upload."""
+    assert wandb.run is not None  # _init_wandb ran before the loop
+    # The previous version must be logged before its files are overwritten.
+    if upload is not None:
+      upload.result()
+    world_model_path = str(log_dir / "world_model.pt")
+    actor_path = str(log_dir / "actor.pt")
+    torch.save(self._wm.bundle(), world_model_path)
+    torch.save(self.policy_learner.actor.state_dict(), actor_path)
+    checkpoint_files = [world_model_path, actor_path]
+    critic = getattr(self.policy_learner, "critic", None)
+    if critic is not None:
+      critic_path = str(log_dir / "critic.pt")
+      torch.save(critic.state_dict(), critic_path)
+      checkpoint_files.append(critic_path)
+    # Skip ONNX export on huge datasets.
+    if (
+      self._representation.actor_obs_mode == "proprio"
+      and self.motion.time_step_total <= 15_000
+    ):
+      checkpoint_files += export_actor_as_onnx(
+        actor=self.policy_learner.actor,
+        env=self.env.unwrapped,
+        path=str(log_dir),
+        run_name=wandb.run.name,
+        term_widths=self._representation.proprio_term_widths(self._num_actions),
+      )
+    return uploader.submit(log_model_artifact, checkpoint_files)
 
   def run(self) -> None:
     log_dir = self._create_log_dir()
@@ -648,33 +687,12 @@ class SuperMimicRunner:
         num_collected_steps = 0
 
       if step % self.cfg.save_interval == 0:
-        assert wandb.run is not None  # _init_wandb ran before the loop
-        # The previous version must be logged before its files are overwritten.
-        if upload is not None:
-          upload.result()
-        world_model_path = str(log_dir / "world_model.pt")
-        actor_path = str(log_dir / "actor.pt")
-        torch.save(self._wm.bundle(), world_model_path)
-        torch.save(self.policy_learner.actor.state_dict(), actor_path)
-        checkpoint_files = [world_model_path, actor_path]
-        critic = getattr(self.policy_learner, "critic", None)
-        if critic is not None:
-          critic_path = str(log_dir / "critic.pt")
-          torch.save(critic.state_dict(), critic_path)
-          checkpoint_files.append(critic_path)
-        # Skip ONNX export on huge datasets.
-        if (
-          self._representation.actor_obs_mode == "proprio"
-          and self.motion.time_step_total <= 15_000
-        ):
-          checkpoint_files += export_actor_as_onnx(
-            actor=self.policy_learner.actor,
-            env=self.env.unwrapped,
-            path=str(log_dir),
-            run_name=wandb.run.name,
-            term_widths=self._representation.proprio_term_widths(self._num_actions),
-          )
-        upload = uploader.submit(log_model_artifact, checkpoint_files)
+        upload = self._save_checkpoint(log_dir, uploader, upload)
 
+    # The loop saves on multiples of save_interval only; keep the final policy.
+    if (self.cfg.max_iterations - 1) % self.cfg.save_interval != 0:
+      upload = self._save_checkpoint(log_dir, uploader, upload)
+    if upload is not None:
+      upload.result()
     uploader.shutdown()
     self._cleanup()

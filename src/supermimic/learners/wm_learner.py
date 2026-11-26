@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 from tensordict import TensorDict
 
 from supermimic.learners.learner_utils import (
@@ -41,6 +42,16 @@ class WorldModelLearnerCfg:
   nominal_error_body_rot: float = 0.1
   nominal_error_body_vel: float = 1.0
   nominal_error_body_avel: float = 3.14
+
+  # Loss Weights — grasped object (gencoord_object), in the robot root frame
+  nominal_error_object_pos: float = 0.01
+  nominal_error_object_rot: float = 0.05
+  nominal_error_object_vel: float = 0.1
+  # Contact makes the object's spin noisy and hard to predict; a loose nominal
+  # error keeps it from dominating the object loss (stayed ~1.2-1.4 at 1.0).
+  nominal_error_object_avel: float = 3.0
+  contact_loss_weight: float = 0.1
+  """Weight on the contact-logit BCE (representations with contacts only)."""
 
 
 class WorldModelLearner:
@@ -102,7 +113,10 @@ class WorldModelLearner:
     self.dynamics.train()
     for p in self._all_params:
       p.requires_grad_(True)
-    batches = torch.stack([td.select("state", "action", "sim_ctx") for td in data])
+    keys = ["state", "action", "sim_ctx"]
+    if self.dynamics.contact_dim:
+      keys.append("contact")
+    batches = torch.stack([td.select(*keys) for td in data])
     return self._captured_update(batches)
 
   def _update_from(self, batches: TensorDict) -> dict[str, torch.Tensor]:
@@ -120,7 +134,7 @@ class WorldModelLearner:
 
       sim_ctx = td["sim_ctx"][:, 0]
 
-      pred_rep_states, pred_aux_states = self._compiled_rollout(
+      pred_rep_states, pred_aux_states, contact_logits = self._compiled_rollout(
         init_rep_state, actions, init_aux, sim_ctx
       )
 
@@ -131,14 +145,25 @@ class WorldModelLearner:
         all_rep_states[:, 1:],
         all_aux_states[:, 1:],
       )
+      loss = loss_state
+      extra: list[torch.Tensor] = []
+      if self.dynamics.contact_dim:
+        # Logits of step k score the contacts of state k + 1.
+        loss_contact = F.binary_cross_entropy_with_logits(
+          contact_logits, td["contact"][:, 1:].float()
+        )
+        loss = loss + self.cfg.contact_loss_weight * loss_contact
+        extra.append(loss_contact.unsqueeze(0))
 
       # 3. Backprop
-      _optimize_step(self.optimizers, loss_state, self._all_params, max_norm=1.0)
+      _optimize_step(self.optimizers, loss, self._all_params, max_norm=1.0)
 
       # 4. Logging
-      stats.append(torch.cat([loss_state.unsqueeze(0), group_mse]).detach())
+      stats.append(torch.cat([loss_state.unsqueeze(0), group_mse, *extra]).detach())
 
     names = ["state", *self.loss_group_weights]
+    if self.dynamics.contact_dim:
+      names.append("contact")
     means = torch.stack(stats).mean(0)
     return {f"Loss/{name}": m for name, m in zip(names, means, strict=True)}
 
@@ -148,23 +173,32 @@ class WorldModelLearner:
     actions: torch.Tensor,
     init_aux: torch.Tensor,
     sim_ctx: torch.Tensor,
-  ) -> tuple[torch.Tensor, torch.Tensor]:
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Autoregressive rollout over the window's actions.
 
     The prediction from the last action is never scored, so the rollout stops
     one step short.
 
     Returns:
-      (pred_rep_states, pred_aux_states), stacked on dim 1.
+      (pred_rep_states, pred_aux_states, contact_logits), stacked on dim 1; the
+      logits are empty (width 0) for representations without contacts.
     """
     rep_state, aux = init_rep_state, init_aux
     pred_rep_states: list[torch.Tensor] = []
     pred_aux_states: list[torch.Tensor] = []
+    logits: list[torch.Tensor] = []
     for k in range(actions.shape[1] - 1):
-      aux, rep_state = self.dynamics(rep_state, actions[:, k], aux, sim_ctx)
+      aux, rep_state, contact = self.dynamics.forward_with_contacts(
+        rep_state, actions[:, k], aux, sim_ctx
+      )
       pred_rep_states.append(rep_state)
       pred_aux_states.append(aux)
-    return torch.stack(pred_rep_states, dim=1), torch.stack(pred_aux_states, dim=1)
+      logits.append(contact)
+    return (
+      torch.stack(pred_rep_states, dim=1),
+      torch.stack(pred_aux_states, dim=1),
+      torch.stack(logits, dim=1),
+    )
 
   def _compute_losses(
     self,

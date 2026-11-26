@@ -216,5 +216,19 @@ __marimo__/
 .streamlit/secrets.toml
 
 **/logs/
-**/wandb/*
+**/wandb/
 **/artifacts/
+
+# Generated grasp clips
+data/
+
+# Local-only grasp tooling and media (not needed to generate clips, train or play)
+src/supermimic/assets/inspire_hand/build_hand_xml.py
+src/supermimic/scripts/view_grasp_clips.py
+src/supermimic/scripts/record_grasp_video.py
+docs/media/*
+!docs/media/grasp_lift.gif
+
+# Grasp tests are kept locally only
+tests/test_g1_inspire.py
+tests/test_grasp_*.py

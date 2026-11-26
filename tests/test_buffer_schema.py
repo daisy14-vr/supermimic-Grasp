@@ -11,7 +11,10 @@ class _Runner(SuperMimicRunner):
 
   def __init__(self, actor_obs_mode: str, history_length: int) -> None:
     self._representation = SimpleNamespace(
-      actor_obs_mode=actor_obs_mode, full_state_dim=71, proprio_obs_dim=lambda n: 64 + n
+      actor_obs_mode=actor_obs_mode,
+      full_state_dim=71,
+      proprio_obs_dim=lambda n: 64 + n,
+      contact_dim=0,
     )
     self._num_actions = 29
     self._sim_context = SimpleNamespace(output_dim=3)

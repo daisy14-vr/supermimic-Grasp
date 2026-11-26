@@ -86,12 +86,15 @@ class WorldModelEnv:
   ) -> tuple[TensorDict, torch.Tensor, torch.Tensor]:
     """Advance one step. Termination and reward score the post-step state against
     the pre-step reference frame, as the simulator does before advancing the clip."""
-    self.aux_state, self.rep_state = self.dynamics(
-      self.rep_state, actions, self.aux_state, self.sim_ctx
+    rep = self.representation
+    self.aux_state, self.rep_state, contact_logits = (
+      self.dynamics.forward_with_contacts(
+        self.rep_state, actions, self.aux_state, self.sim_ctx
+      )
     )
-    self.joint_state = self.representation.joint_state(self.rep_state)
+    self.joint_state = rep.joint_state(self.rep_state)
     term_prob = self._compute_term_prob(self.aux_state, *self._ref_body_state[:2])
-    rewards = self.representation.compute_wm_reward_from_reference(
+    rewards = rep.compute_wm_reward_from_reference(
       self.rep_state,
       self.aux_state,
       self.joint_state,
@@ -99,6 +102,15 @@ class WorldModelEnv:
       self.last_actions,
       *self._ref_body_state,
     )
+    if rep.contact_dim:
+      # Grasp: object tracking + contact match, and the object-drop termination.
+      rewards = rewards + rep.object_reward(
+        self.aux_state, self.rep_state, contact_logits, self.motion_times
+      )
+      object_term = rep.object_term_prob(
+        self.aux_state, self.rep_state, self.motion_times, self._termination_softness
+      )
+      term_prob = 1.0 - (1.0 - term_prob) * (1.0 - object_term)
     self.last_actions = actions
 
     self._compute_commands()
